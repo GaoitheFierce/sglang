@@ -288,6 +288,10 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
 
+    # Early Exitfor Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point: int = None
+
     @classmethod
     def init_new(
         cls,
@@ -327,6 +331,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            ee_point=batch.ee_point,
         )
         device = model_runner.device
 

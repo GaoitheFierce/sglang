@@ -292,6 +292,11 @@ class ModelRunner:
         )
         self.num_effective_layers = self.end_layer - self.start_layer
 
+        if self.model_config.is_ee_model:
+            self.num_effective_layers += getattr(
+                self.model, "ee_end_layer", self.model_config.num_ee_layers
+            ) - getattr(self.model, "ee_start_layer", 0)
+
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied

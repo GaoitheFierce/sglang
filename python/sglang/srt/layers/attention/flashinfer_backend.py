@@ -306,6 +306,7 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        ee_point: int = None,
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -332,7 +333,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            if ee_point is not None:
+                self.decode_cuda_graph_metadata[(ee_point, bs)] = decode_wrappers
+            else:
+                self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
             for i in range(self.num_wrappers):
                 decode_wrappers[i].begin_forward = partial(
@@ -365,7 +369,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            if ee_point is not None:
+                self.prefill_cuda_graph_metadata[(ee_point, bs)] = prefill_wrappers
+            else:
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -394,7 +401,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            if ee_point is not None:
+                self.prefill_cuda_graph_metadata[(ee_point, bs)] = prefill_wrappers
+            else:
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -409,13 +419,18 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        ee_point: int = None,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                decode_wrappers=(
+                    self.decode_cuda_graph_metadata[(ee_point, bs)]
+                    if ee_point is not None
+                    else self.decode_cuda_graph_metadata[bs]
+                ),
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
@@ -425,7 +440,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=(
+                    self.prefill_cuda_graph_metadata[bs]
+                    if ee_point is None
+                    else self.prefill_cuda_graph_metadata[(ee_point, bs)]
+                ),
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -436,7 +455,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=(
+                    self.prefill_cuda_graph_metadata[bs]
+                    if ee_point is None
+                    else self.prefill_cuda_graph_metadata[(ee_point, bs)]
+                ),
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,

@@ -93,6 +93,26 @@ def get_pp_indices(
     return (start_layer, end_layer)
 
 
+def get_ee_pp_indices(
+    start_layer: int,
+    end_layer: int,
+    ee_idx_list: list,
+) -> Tuple[int, int]:
+    """
+    Compute the range of early-exit indices within a pipeline-parallel partition.
+    See also: https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    """
+    ee_count = len(ee_idx_list)
+    included = [x for x in ee_idx_list if start_layer <= x < end_layer]
+    ee_idx_start = ee_count
+    ee_idx_end = ee_count
+    if included:
+        ee_idx_start = ee_idx_list.index(included[0])
+        ee_idx_end = ee_idx_list.index(included[-1]) + 1
+
+    return (ee_idx_start, ee_idx_end)
+
+
 @dataclasses.dataclass
 class StatelessProcessGroup:
     """A dataclass to hold a metadata store, and the rank, world_size of the

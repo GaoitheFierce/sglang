@@ -350,6 +350,22 @@ class Scheduler(
             nccl_port=port_args.nccl_port,
         )
 
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            is_ee_model = self.tp_worker.worker.model_config.is_ee_model
+        else:
+            is_ee_model = self.tp_worker.model_config.is_ee_model
+        disable_cuda_graph = self.server_args.disable_cuda_graph
+        enable_ee_bucket = self.server_args.enable_ee_bucket
+        if is_ee_model and not disable_cuda_graph and not enable_ee_bucket:
+            raise ValueError(
+                "Early‑exit models must set `enable_ee_bucket=True` when using CUDA Graph."
+            )
+
+        if not is_ee_model and enable_ee_bucket:
+            raise ValueError(
+                "`enable_ee_bucket` can only be enabled for early‑exit (EE) models."
+            )
+
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -419,6 +435,13 @@ class Scheduler(
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
+
+        self.enable_ee_bucket = server_args.enable_ee_bucket
+        if self.enable_ee_bucket:
+            from collections import defaultdict, deque
+
+            self.waiting_buckets = defaultdict(deque)
+            self.cur_bucket_id = None
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -1129,6 +1152,9 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if recv_req.ee_point is not None:
+                req.ee_point = recv_req.ee_point
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
@@ -1154,6 +1180,8 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            if recv_req.ee_point is not None:
+                req.ee_point = recv_req.ee_point
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -1264,7 +1292,17 @@ class Scheduler(
                     self.tree_cache.prefetch_from_storage(
                         req.rid, req.last_host_node, new_input_tokens, last_hash
                     )
-            self.waiting_queue.append(req)
+
+            if self.model_config.is_ee_model:
+                ee_point = req.ee_point
+                if ee_point is None:
+                    ee_point = self.model_config.default_early_exit_point
+                if self.enable_ee_bucket:
+                    self.waiting_buckets[ee_point].append(req)
+                else:
+                    self.waiting_queue.append(req)
+            else:
+                self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1668,6 +1706,14 @@ class Scheduler(
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
+        if self.enable_ee_bucket and len(self.waiting_queue) == 0:
+            bucket_id = self._pick_next_bucket()
+            if bucket_id is None:
+                return None
+            self.cur_bucket_id = bucket_id
+            bucket_q = self.waiting_buckets[bucket_id]
+            self.waiting_queue = bucket_q
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -1756,6 +1802,12 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        if self.enable_ee_bucket and self.waiting_buckets:
+            for r in can_run_list:
+                bucket_q.remove(r)
+            if not bucket_q and self.cur_bucket_id is not None:
+                del self.waiting_buckets[self.cur_bucket_id]
+
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
@@ -1788,6 +1840,15 @@ class Scheduler(
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
+
+        if self.model_config.is_ee_model:
+            ee_point = None
+            if not self.enable_ee_bucket:
+                ee_point = self.model_config.default_early_exit_point
+            else:
+                ee_point = self.cur_bucket_id
+            new_batch.ee_point = ee_point
+
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -2856,6 +2917,15 @@ class Scheduler(
             if events:
                 batch = KVEventBatch(ts=time.time(), events=events)
                 self.kv_event_publisher.publish(batch)
+
+    def _pick_next_bucket(self):
+        if not self.waiting_buckets:
+            return None
+        return max(
+            self.waiting_buckets,
+            key=lambda b: len(self.waiting_buckets[b]),
+            default=None,
+        )
 
 
 def is_health_check_generate_req(recv_req):

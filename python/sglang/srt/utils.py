@@ -492,6 +492,134 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     return module
 
 
+def make_ee_layers(
+    start_layer: int,
+    end_layer: int,
+    ee_idx_list: list,
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
+    prefix: str = "",
+    return_tuple: bool = False,
+) -> Tuple[int, int, torch.nn.ModuleList]:
+    """Build a ModuleList of early-exit transformer layers for a PP partition."""
+    from sglang.srt.distributed.utils import get_ee_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    assert not pp_size or num_hidden_layers >= pp_size
+
+    ee_count = len(ee_idx_list)
+    ee_idx_start, ee_idx_end = (
+        get_ee_pp_indices(
+            start_layer,
+            end_layer,
+            ee_idx_list,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, ee_count)
+    )
+
+    modules = torch.nn.ModuleList(
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(ee_idx_start)]
+        + [
+            maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
+            for idx in range(ee_idx_start, ee_idx_end)
+        ]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(ee_idx_end, ee_count)
+        ]
+    )
+
+    if pp_rank is None or pp_size is None:
+        return modules
+
+    return modules, ee_idx_start, ee_idx_end
+
+
+def make_ee_norms(
+    start_layer: int,
+    end_layer: int,
+    ee_idx_list: list,
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
+    prefix: str = "",
+    return_tuple: bool = False,
+) -> Tuple[int, int, torch.nn.ModuleList]:
+    """Build a ModuleList of early-exit normalization layers for a PP partition."""
+    from sglang.srt.distributed.utils import get_ee_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    ee_count = len(ee_idx_list)
+    ee_idx_start, ee_idx_end = (
+        get_ee_pp_indices(
+            start_layer,
+            end_layer,
+            ee_idx_list,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, ee_count)
+    )
+
+    modules = torch.nn.ModuleList(
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(ee_idx_start)]
+        + [layer_fn() for idx in range(ee_idx_start, ee_idx_end)]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(ee_idx_end, ee_count)
+        ]
+    )
+
+    if pp_rank is None or pp_size is None:
+        return modules
+
+    return modules, ee_idx_start, ee_idx_end
+
+
+def make_ee_head(
+    start_layer: int,
+    end_layer: int,
+    ee_idx_list: list,
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
+    prefix: str = "",
+    return_tuple: bool = False,
+) -> Tuple[int, int, torch.nn.ModuleList]:
+    """Build a ModuleList of early-exit head layers for a PP partition."""
+    from sglang.srt.distributed.utils import get_ee_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    ee_count = len(ee_idx_list)
+    ee_idx_start, ee_idx_end = (
+        get_ee_pp_indices(
+            start_layer,
+            end_layer,
+            ee_idx_list,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, ee_count)
+    )
+
+    modules = torch.nn.ModuleList(
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(ee_idx_start)]
+        + [layer_fn() for idx in range(ee_idx_start, ee_idx_end)]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(ee_idx_end, ee_count)
+        ]
+    )
+
+    if pp_rank is None or pp_size is None:
+        return modules
+
+    return modules, ee_idx_start, ee_idx_end
+
+
 class LayerFn(Protocol):
 
     def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...

@@ -123,6 +123,10 @@ class GenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # Early Exit Point for Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point: Optional[int] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -475,6 +479,7 @@ class GenerateReqInput:
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
+            ee_point=self.ee_point,
         )
 
 
@@ -524,6 +529,10 @@ class TokenizedGenerateReqInput:
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # Early Exit Point for Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point: Optional[int] = None
 
 
 @dataclass
