@@ -92,6 +92,8 @@ class BenchArgs:
     profile: bool = False
     profile_filename_prefix: str = "profile"
 
+    ee_point: int = -1
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
@@ -124,6 +126,13 @@ class BenchArgs:
             default=BenchArgs.profile_filename_prefix,
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+        )
+
+        parser.add_argument(
+            "--ee-point",
+            type=int,
+            default=BenchArgs.ee_point,
+            help="Early Exit for Ruyi Models, see also https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi",
         )
 
     @classmethod
@@ -185,6 +194,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
             origin_input_ids=tmp_input_ids,
             sampling_params=sampling_params,
         )
+        req.ee_point = bench_args.ee_point
         req.prefix_indices = []
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
@@ -208,7 +218,7 @@ def prepare_extend_inputs_for_correctness_test(
     return reqs
 
 
-def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
+def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, bench_args=None):
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
@@ -223,6 +233,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
             origin_input_ids=list(input_ids[i]),
             sampling_params=sampling_params,
         )
+        req.ee_point = bench_args.ee_point if bench_args is not None else None
         req.prefix_indices = []
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
@@ -450,7 +461,7 @@ def latency_test(
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0], bench_args.input_len[0], bench_args
     )
 
     # Warm up
@@ -476,7 +487,7 @@ def latency_test(
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bench_args)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,

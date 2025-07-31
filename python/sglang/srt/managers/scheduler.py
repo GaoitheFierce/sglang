@@ -846,6 +846,8 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            # if batch is not None:
+            #     print(batch.ee_point, batch.forward_mode)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1154,6 +1156,8 @@ class Scheduler(
 
             if recv_req.ee_point is not None:
                 req.ee_point = recv_req.ee_point
+                if req.ee_point == -1:
+                    req.ee_point = self.model_config.early_exit_points[-1]
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1182,6 +1186,8 @@ class Scheduler(
             req = session.create_req(recv_req, self.tokenizer)
             if recv_req.ee_point is not None:
                 req.ee_point = recv_req.ee_point
+                if req.ee_point == -1:
+                    req.ee_point = self.model_config.early_exit_points[-1]
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -1313,6 +1319,14 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
+            # if self.enable_ee_bucket and self.model_config.is_ee_model:
+            #     for r in reqs:
+            #         ee_point = r.ee_point
+            #         if ee_point is None:
+            #             ee_point = self.model_config.default_early_exit_point
+            #         self.waiting_buckets[ee_point].append(r)
+            # else:
+            #     self.waiting_queue.extend(reqs)
             self.waiting_queue.extend(reqs)
 
     def handle_embedding_request(
@@ -1711,8 +1725,7 @@ class Scheduler(
             if bucket_id is None:
                 return None
             self.cur_bucket_id = bucket_id
-            bucket_q = self.waiting_buckets[bucket_id]
-            self.waiting_queue = bucket_q
+            self.waiting_queue = self.waiting_buckets[bucket_id]
 
         # Handle the cases where prefill is not allowed
         if (
@@ -1802,20 +1815,20 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        if self.enable_ee_bucket and self.waiting_buckets:
-            for r in can_run_list:
-                bucket_q.remove(r)
-            if not bucket_q and self.cur_bucket_id is not None:
-                del self.waiting_buckets[self.cur_bucket_id]
-
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        if self.enable_ee_bucket:
+            for r in can_run_list:
+                keep = [x for x in self.waiting_queue if x not in can_run_list]
+                self.waiting_queue.clear()
+                self.waiting_queue.extend(keep)
+        else:
+            self.waiting_queue = [
+                x for x in self.waiting_queue if x not in set(can_run_list)
+            ]
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -1848,6 +1861,12 @@ class Scheduler(
             else:
                 ee_point = self.cur_bucket_id
             new_batch.ee_point = ee_point
+
+        if self.enable_ee_bucket:
+            if not self.waiting_queue and self.cur_bucket_id is not None:
+                del self.waiting_buckets[self.cur_bucket_id]
+                self.waiting_queue = []
+                self.cur_bucket_id = None
 
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

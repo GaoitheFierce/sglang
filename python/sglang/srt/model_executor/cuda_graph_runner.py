@@ -766,6 +766,12 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.model_runner.model_config.is_ee_model:
+            ee_point = forward_batch.ee_point
+            if ee_point is None:
+                ee_point = self.model_runner.model_config.default_early_exit_point
+                forward_batch.ee_point = ee_point
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -775,9 +781,6 @@ class CudaGraphRunner:
 
         # Replay
         if self.model_runner.model_config.is_ee_model:
-            ee_point = forward_batch.ee_point
-            if ee_point is None:
-                ee_point = self.model_runner.model_config.default_early_exit_point
             self.graphs[(ee_point, self.bs)].replay()
             output = self.output_buffers[(ee_point, self.bs)]
         else:

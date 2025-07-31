@@ -199,6 +199,10 @@ class CompletionRequest(BaseModel):
     # For request id
     rid: Optional[Union[List[str], str]] = None
 
+    # Early Exit for Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point: Optional[int] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -462,6 +466,10 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+
+    # Early Exit for Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point: Optional[int] = None
 
 
 class ChatMessage(BaseModel):
