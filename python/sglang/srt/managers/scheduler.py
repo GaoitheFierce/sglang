@@ -26,7 +26,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -440,8 +440,13 @@ class Scheduler(
         if self.enable_ee_bucket:
             from collections import defaultdict, deque
 
-            self.waiting_buckets = defaultdict(deque)
-            self.cur_bucket_id = None
+            self.waiting_buckets: Dict[int, Deque[Req]] = defaultdict(deque)
+            self.cur_bucket_id: Optional[int] = None
+
+            self.running_buckets: Dict[int, ScheduleBatch] = defaultdict(
+                lambda: ScheduleBatch(reqs=[], batch_is_full=False)
+            )
+            self.running_bucket_id: Optional[int] = None
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -846,8 +851,8 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            # if batch is not None:
-            #     print(batch.ee_point, batch.forward_mode)
+            if batch is not None:
+                print(batch.ee_point, batch.forward_mode)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1319,15 +1324,14 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
-            # if self.enable_ee_bucket and self.model_config.is_ee_model:
-            #     for r in reqs:
-            #         ee_point = r.ee_point
-            #         if ee_point is None:
-            #             ee_point = self.model_config.default_early_exit_point
-            #         self.waiting_buckets[ee_point].append(r)
-            # else:
-            #     self.waiting_queue.extend(reqs)
-            self.waiting_queue.extend(reqs)
+            if self.enable_ee_bucket:
+                for r in reqs:
+                    ee_point = r.ee_point
+                    if ee_point is None:
+                        ee_point = self.model_config.default_early_exit_point
+                    self.waiting_buckets[ee_point].append(r)
+            else:
+                self.waiting_queue.extend(reqs)
 
     def handle_embedding_request(
         self,
@@ -1674,13 +1678,21 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch
-            if not self.last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+            if self.enable_ee_bucket:
+                if not self.last_batch.is_empty():
+                    ee_point = self.last_batch.ee_point
+                    if self.running_buckets[ee_point].is_empty():
+                        self.running_buckets[ee_point] = self.last_batch
+                    else:
+                        self.running_buckets[ee_point].merge_batch(self.last_batch)
+            else:
+                # Merge the new batch into the running batch
+                if not self.last_batch.is_empty():
+                    if self.running_batch.is_empty():
+                        self.running_batch = self.last_batch
+                    else:
+                        # Merge running_batch with prefill batch
+                        self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
 
@@ -1697,6 +1709,10 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode
+            if self.enable_ee_bucket:
+                self.running_bucket_id = self._pick_running_bucket()
+                self.running_batch = self.running_buckets[self.running_bucket_id]
+
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
@@ -2943,6 +2959,13 @@ class Scheduler(
         return max(
             self.waiting_buckets,
             key=lambda b: len(self.waiting_buckets[b]),
+            default=None,
+        )
+
+    def _pick_running_bucket(self):
+        return max(
+            self.running_buckets,
+            key=lambda b: self.running_buckets[b].batch_size(),
             default=None,
         )
 
