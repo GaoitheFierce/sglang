@@ -25,7 +25,12 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import (
+    PPMissingLayer,
+    get_layer_id,
+    get_lm_head_id,
+    get_norms_id,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -308,7 +313,7 @@ class RuyiQwen2Model(nn.Module):
             self.ee_idx_list[:-1],
             config.num_hidden_layers,
             lambda idx, prefix: decoder_layer_type(
-                layer_id=idx + config.num_hidden_layers,
+                layer_id=idx + (self.end_layer - self.start_layer),
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -320,7 +325,7 @@ class RuyiQwen2Model(nn.Module):
         )
 
         # Create one normalization layer per early-exit point
-        self.norms, _, _ = make_ee_norms(
+        self.norms, self.norms_start, self.norms_end = make_ee_norms(
             self.start_layer,
             self.end_layer,
             self.ee_idx_list,
@@ -375,12 +380,15 @@ class RuyiQwen2Model(nn.Module):
 
         # If the requested start layer is already past ee_point, exit immediately
         if ee_point < self.start_layer:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            if self.pp_group.is_last_rank:
+                return hidden_states
+            else:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
+                )
 
         # ee_point >= self.start_layer
         # Run the main branch up to the early-exit layer
@@ -526,21 +534,24 @@ class RuyiQwen2ForCausalLM(nn.Module):
             else:
                 self.lm_head = PPMissingLayer()
         else:
-            self.lm_head, _, _ = make_ee_head(
-                self.model.start_layer,
-                self.model.end_layer,
-                self.model.ee_idx_list,
-                config.num_hidden_layers,
-                lambda *args: ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
+            if self.pp_group.is_last_rank:
+                self.lm_head, self.lm_head_start, self.lm_head_end = make_ee_head(
+                    0,
+                    self.model.num_hidden_layers,
+                    self.model.ee_idx_list,
+                    config.num_hidden_layers,
+                    lambda *args: ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    ),
+                    pp_rank=self.pp_group.rank_in_group,
+                    pp_size=self.pp_group.world_size,
                     prefix=add_prefix("lm_head", prefix),
-                ),
-                pp_rank=self.pp_group.rank_in_group,
-                pp_size=self.pp_group.world_size,
-                prefix=add_prefix("lm_head", prefix),
-            )
+                )
+            else:
+                self.lm_head = PPMissingLayer()
 
         # perform weight tying for PP
         if self.shared_heads:
@@ -591,16 +602,9 @@ class RuyiQwen2ForCausalLM(nn.Module):
         else:
             ee_point = forward_batch.ee_point
 
-        start_layer = self.model.start_layer
-        end_layer = self.model.end_layer
-
-        # Cases we need to handle:
-        #  1) The exit happened in an earlier PP rank  → just pass through
-        #  2) The exit happens in this PP rank         → apply the LLM head or pooler
-        #  3) No early exit (exit point beyond this rank) → pass through to next rank
-        if start_layer > ee_point:
+        if not self.pp_group.is_last_rank:
             return hidden_states
-        elif start_layer <= ee_point < end_layer:
+        else:
             if not get_embedding:
                 head_idx = self.model.ee_idx_list.index(ee_point)
                 head = self.lm_head[head_idx]
@@ -609,8 +613,6 @@ class RuyiQwen2ForCausalLM(nn.Module):
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
-        else:
-            return hidden_states
 
     @property
     def start_layer(self):
@@ -633,15 +635,48 @@ class RuyiQwen2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+            norms_id = get_norms_id(name)
+            lm_head_id = get_lm_head_id(name)
+            if "eelayers" in name:
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "ee_start_layer")
+                    and (
+                        layer_id < self.model.ee_start_layer
+                        or layer_id >= self.model.ee_end_layer
+                    )
+                ):
+                    continue
+            elif "norms" in name:
+                if (
+                    norms_id is not None
+                    and hasattr(self.model, "norms_start")
+                    and (
+                        norms_id < self.model.norms_start
+                        or norms_id >= self.model.norms_end
+                    )
+                ):
+                    continue
+            elif "lm_head" in name:
+                if (
+                    lm_head_id is not None
+                    and hasattr(self, "lm_head_start")
+                    and (
+                        lm_head_id < self.lm_head_start
+                        or lm_head_id >= self.lm_head_end
+                    )
+                ):
+                    continue
+            else:
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
+                    continue
 
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue

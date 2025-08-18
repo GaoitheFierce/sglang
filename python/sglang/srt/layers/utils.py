@@ -14,6 +14,22 @@ def get_layer_id(weight_name):
     return None
 
 
+def get_norms_id(weight_name):
+    # example weight_name: model.norms.3.weight
+    match = re.search(r"norms\.(\d+)\.", weight_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def get_lm_head_id(weight_name):
+    # example weight_name: lm_head.4.weight
+    match = re.search(r"lm_head\.(\d+)\.", weight_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 class PPMissingLayer(torch.nn.Identity):
     # Adapted from
     # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1

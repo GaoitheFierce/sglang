@@ -443,10 +443,16 @@ class Scheduler(
             self.waiting_buckets: Dict[int, Deque[Req]] = defaultdict(deque)
             self.cur_bucket_id: Optional[int] = None
 
-            self.running_buckets: Dict[int, ScheduleBatch] = defaultdict(
-                lambda: ScheduleBatch(reqs=[], batch_is_full=False)
-            )
-            self.running_bucket_id: Optional[int] = None
+            if self.pp_size > 1:
+                self.running_buckets: List[Dict[int, ScheduleBatch]] = [
+                    defaultdict(lambda: ScheduleBatch(reqs=[], batch_is_full=False))
+                    for _ in range(self.pp_size)
+                ]
+            else:
+                self.running_buckets: Dict[int, ScheduleBatch] = defaultdict(
+                    lambda: ScheduleBatch(reqs=[], batch_is_full=False)
+                )
+                self.running_bucket_id: Optional[int] = None
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -851,8 +857,6 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            if batch is not None:
-                print(batch.ee_point, batch.forward_mode)
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -906,7 +910,8 @@ class Scheduler(
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
-                mbs[mb_id] = self.get_next_batch_to_run()
+
+                mbs[mb_id] = self.get_next_batch_to_run(mb_id=mb_id)
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch = mbs[mb_id]
@@ -1654,7 +1659,9 @@ class Scheduler(
             swa_evictable_size,
         )
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+    def get_next_batch_to_run(
+        self, mb_id: Optional[int] = None
+    ) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1681,10 +1688,18 @@ class Scheduler(
             if self.enable_ee_bucket:
                 if not self.last_batch.is_empty():
                     ee_point = self.last_batch.ee_point
-                    if self.running_buckets[ee_point].is_empty():
-                        self.running_buckets[ee_point] = self.last_batch
+                    if self.pp_size > 1 and mb_id is not None:
+                        if self.running_buckets[mb_id][ee_point].is_empty():
+                            self.running_buckets[mb_id][ee_point] = self.last_batch
+                        else:
+                            self.running_buckets[mb_id][ee_point].merge_batch(
+                                self.last_batch
+                            )
                     else:
-                        self.running_buckets[ee_point].merge_batch(self.last_batch)
+                        if self.running_buckets[ee_point].is_empty():
+                            self.running_buckets[ee_point] = self.last_batch
+                        else:
+                            self.running_buckets[ee_point].merge_batch(self.last_batch)
             else:
                 # Merge the new batch into the running batch
                 if not self.last_batch.is_empty():
@@ -1710,14 +1725,35 @@ class Scheduler(
         else:
             # Run decode
             if self.enable_ee_bucket:
-                self.running_bucket_id = self._pick_running_bucket()
-                self.running_batch = self.running_buckets[self.running_bucket_id]
-
-            if not self.running_batch.is_empty():
-                self.running_batch = self.update_running_batch(self.running_batch)
+                bucket_hit = False
+                while not bucket_hit:
+                    bucket_hit = True
+                    if self.pp_size > 1 and mb_id is not None:
+                        bucket_id = self._pick_running_bucket(mb_id)
+                    else:
+                        bucket_id = self._pick_running_bucket()
+                    if bucket_id is not None:
+                        if self.pp_size > 1 and mb_id is not None:
+                            self.running_batch = self.running_buckets[mb_id][bucket_id]
+                        else:
+                            self.running_batch = self.running_buckets[bucket_id]
+                    if not self.running_batch.is_empty():
+                        self.running_batch = self.update_running_batch(
+                            self.running_batch
+                        )
+                        if self.running_batch.is_empty():
+                            bucket_hit = False
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
-                ret = None
+                if not self.running_batch.is_empty():
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    ret = (
+                        self.running_batch
+                        if not self.running_batch.is_empty()
+                        else None
+                    )
+                else:
+                    ret = None
 
         # Handle DP attention
         if need_dp_attn_preparation:
@@ -2962,12 +2998,19 @@ class Scheduler(
             default=None,
         )
 
-    def _pick_running_bucket(self):
-        return max(
-            self.running_buckets,
-            key=lambda b: self.running_buckets[b].batch_size(),
-            default=None,
-        )
+    def _pick_running_bucket(self, mb_id: Optional[int] = None):
+        if mb_id is None:
+            return max(
+                self.running_buckets,
+                key=lambda b: self.running_buckets[b].batch_size(),
+                default=None,
+            )
+        else:
+            return max(
+                self.running_buckets[mb_id],
+                key=lambda b: self.running_buckets[mb_id][b].batch_size(),
+                default=None,
+            )
 
 
 def is_health_check_generate_req(recv_req):
