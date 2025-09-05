@@ -290,7 +290,7 @@ class ForwardBatch:
 
     # Early Exitfor Ruyi Models
     # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
-    ee_point: int = None
+    ee_point: Optional[int] = None
 
     @classmethod
     def init_new(

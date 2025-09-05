@@ -1168,6 +1168,8 @@ class Scheduler(
                 req.ee_point = recv_req.ee_point
                 if req.ee_point == -1:
                     req.ee_point = self.model_config.early_exit_points[-1]
+                if req.ee_point not in self.model_config.early_exit_points:
+                    req.ee_point = self.model_config.default_early_exit_point
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1198,6 +1200,9 @@ class Scheduler(
                 req.ee_point = recv_req.ee_point
                 if req.ee_point == -1:
                     req.ee_point = self.model_config.early_exit_points[-1]
+                if req.ee_point not in self.model_config.early_exit_points:
+                    req.ee_point = self.model_config.default_early_exit_point
+
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -1873,10 +1878,11 @@ class Scheduler(
                 req.queue_time_end = time.perf_counter()
 
         if self.enable_ee_bucket:
-            for r in can_run_list:
-                keep = [x for x in self.waiting_queue if x not in can_run_list]
-                self.waiting_queue.clear()
-                self.waiting_queue.extend(keep)
+            # Filter once (O(n)) and mutate in-place to preserve alias to bucket deque
+            can_run_ids = {id(x) for x in can_run_list}
+            keep = [x for x in self.waiting_queue if id(x) not in can_run_ids]
+            self.waiting_queue.clear()
+            self.waiting_queue.extend(keep)
         else:
             self.waiting_queue = [
                 x for x in self.waiting_queue if x not in set(can_run_list)

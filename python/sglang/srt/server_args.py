@@ -1840,6 +1840,9 @@ class ServerArgs:
         assert (
             not self.enable_ee_bucket or self.attention_backend == "flashinfer"
         ), "Early exit is currently only supported for flashinfer attention backend"
+        assert (
+            not self.enable_ee_bucket or self.disable_radix_cache
+        ), "Early exit is currently not supported for Radix Cache"
 
     def check_lora_server_args(self):
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
