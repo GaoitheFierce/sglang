@@ -264,6 +264,12 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    # Early Exit for Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    # False by default (non-Ruyi models)
+    # Required for Ruyi models only when CUDA Graph is enabled
+    enable_ee_bucket: bool = False
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -1765,6 +1771,12 @@ class ServerArgs:
             help="Disable mmap while loading weight using safetensors.",
         )
 
+        parser.add_argument(
+            "--enable-ee-bucket",
+            action="store_true",
+            help="Enable CUDA-Graph bucket scheduler for Ruyi Models",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -1821,6 +1833,16 @@ class ServerArgs:
         }, "moe_dense_tp_size only support 1 and None currently"
 
         self.check_lora_server_args()
+
+        assert (
+            not self.enable_ee_bucket or self.disaggregation_mode == "null"
+        ), "Early exit is currently not supported for disaggregation"
+        assert (
+            not self.enable_ee_bucket or self.attention_backend == "flashinfer"
+        ), "Early exit is currently only supported for flashinfer attention backend"
+        assert (
+            not self.enable_ee_bucket or self.disable_radix_cache
+        ), "Early exit is currently not supported for Radix Cache"
 
     def check_lora_server_args(self):
         # Enable LoRA if any LoRA paths are provided for backward compatibility.

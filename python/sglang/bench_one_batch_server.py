@@ -47,6 +47,8 @@ class BenchArgs:
     profile: bool = False
     profile_by_stage: bool = False
 
+    ee_point: int = -1
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
@@ -79,6 +81,13 @@ class BenchArgs:
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument("--profile-by-stage", action="store_true")
+
+        parser.add_argument(
+            "--ee-point",
+            type=int,
+            default=BenchArgs.ee_point,
+            help="Early Exit for Ruyi Models, see also https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -133,6 +142,7 @@ def run_one_case(
     tokenizer,
     profile: bool = False,
     profile_by_stage: bool = False,
+    ee_point: int = -1,
 ):
     requests.post(url + "/flush_cache")
     input_requests = sample_random_requests(
@@ -179,6 +189,7 @@ def run_one_case(
             },
             "return_logprob": return_logprob,
             "stream": True,
+            "ee_point": ee_point,
         },
         stream=True,
     )
@@ -275,6 +286,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
+            ee_point=bench_args.ee_point,
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -298,6 +310,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    ee_point=bench_args.ee_point,
                 )
             )
 
@@ -322,6 +335,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 tokenizer=tokenizer,
                                 profile=bench_args.profile,
                                 profile_by_stage=bench_args.profile_by_stage,
+                                ee_point=bench_args.ee_point,
                             )[-1],
                         )
                     )

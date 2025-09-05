@@ -273,6 +273,15 @@ class ModelConfig:
             config, "image_token_index", None
         )
 
+        self.is_ee_model = False
+        if config.model_type in ("ruyi_qwen2", "ee_qwen2"):
+            self.is_ee_model = True
+            self.early_exit_points = config.early_exit_points
+            self.default_early_exit_point = config.default_early_exit_point
+            if self.default_early_exit_point == -1:
+                self.default_early_exit_point = self.early_exit_points[-1]
+            self.num_ee_layers = len(config.early_exit_points)
+
     @staticmethod
     def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
         return ModelConfig(

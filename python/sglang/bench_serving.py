@@ -22,6 +22,7 @@ import time
 import traceback
 import warnings
 from argparse import ArgumentParser
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from json import JSONDecodeError
@@ -1342,6 +1343,36 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+    # Helper to build a sequential EE schedule
+    def _build_ee_schedule(points, probs, total):
+        if points is None or total <= 0:
+            return None
+        if probs is None:
+            probs = [1.0 / len(points)] * len(points)
+        # normalize
+        s = sum(probs) if sum(probs) > 0 else 1.0
+        probs = [p / s for p in probs]
+        raw = [p * total for p in probs]
+        base = [int(x) for x in raw]
+        remainder = total - sum(base)
+        # distribute remainder by largest fractional parts
+        fracs = sorted(
+            ((raw[i] - base[i], i) for i in range(len(points))), reverse=True
+        )
+        for k in range(remainder):
+            base[fracs[k][1]] += 1
+        # assemble schedule in ascending order of points
+        order = sorted(range(len(points)), key=lambda i: points[i])
+        sched = []
+        for i in order:
+            sched.extend([points[i]] * base[i])
+        # adjust length if rounding drift
+        if len(sched) < total:
+            sched.extend([points[order[-1]]] * (total - len(sched)))
+        elif len(sched) > total:
+            sched = sched[:total]
+        return sched
+
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
@@ -1368,6 +1399,28 @@ async def benchmark(
     # Run warmup requests
     warmup_tasks = []
     for _ in range(warmup_requests):
+        if extra_request_body["random_ee_points"] is not None:
+            per_req_boy = extra_request_body.copy()
+            points = args.random_ee_points
+            probs = args.random_ee_probs
+            if getattr(args, "random_ee_sequential", False):
+                ee_point_choice = min(points)
+            else:
+                if probs is not None:
+                    ee_point_choice = random.choices(points, weights=probs, k=1)[0]
+                else:
+                    ee_point_choice = random.choice(points)
+            per_req_boy["ee_point"] = ee_point_choice
+            test_input = RequestFuncInput(
+                model=model_id,
+                prompt=test_request.prompt,
+                api_url=api_url,
+                prompt_len=test_request.prompt_len,
+                output_len=min(test_request.output_len, 32),
+                lora_name=lora_name,
+                image_data=test_request.image_data,
+                extra_request_body=per_req_boy,
+            )
         warmup_tasks.append(
             asyncio.create_task(request_func(request_func_input=test_input))
         )
@@ -1402,9 +1455,20 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
+    # Build sequential schedule for main run if requested
+    ee_schedule = None
+    schedule_idx = 0
+    if extra_request_body["random_ee_points"] is not None and getattr(
+        args, "random_ee_sequential", False
+    ):
+        ee_schedule = _build_ee_schedule(
+            args.random_ee_points, args.random_ee_probs, len(input_requests)
+        )
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    random_ee_points: List[int] = []
     async for request in get_request(input_requests, request_rate):
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
@@ -1422,12 +1486,45 @@ async def benchmark(
             image_data=request.image_data,
             extra_request_body=extra_request_body,
         )
-
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+        if extra_request_body["random_ee_points"] is not None:
+            per_req_body = extra_request_body.copy()
+            points = args.random_ee_points
+            probs = args.random_ee_probs
+            if getattr(args, "random_ee_sequential", False) and ee_schedule is not None:
+                ee_point = ee_schedule[schedule_idx]
+                schedule_idx += 1
+            else:
+                if probs is not None:
+                    ee_point = random.choices(points, weights=probs, k=1)[0]
+                else:
+                    ee_point = random.choice(points)
+            per_req_body["ee_point"] = ee_point
+            random_ee_points.append(ee_point)
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=per_req_body,
             )
-        )
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input, pbar=pbar
+                    )
+                )
+            )
+        else:
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input, pbar=pbar
+                    )
+                )
+            )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     # Stop profiler
@@ -1524,7 +1621,15 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
-    print("=" * 50)
+
+    if len(random_ee_points) > 0:
+        counter = Counter(random_ee_points)
+        total = len(random_ee_points)
+        print("{s:{c}^{n}}".format(s="Early Exit Point Distribution", n=50, c="-"))
+        for ee_point, count in sorted(counter.items()):
+            ratio = count / total * 100
+            print("{:<40} {:<10.2f}".format(f"EE point {ee_point} (%):", ratio))
+        print("=" * 50)
 
     if (
         metrics.median_ttft_ms is not None
@@ -1599,6 +1704,7 @@ async def benchmark(
             result_for_dump = result | result_details
         else:
             result_for_dump = result
+
         file.write(json.dumps(result_for_dump) + "\n")
 
     return result | result_details
@@ -1647,6 +1753,31 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+
+    extra_request_body["random_ee_points"] = args.random_ee_points
+    extra_request_body["ee_point"] = args.ee_point
+
+    assert not (
+        args.random_ee_points is not None and args.ee_point is not None
+    ), "Cannot specify both random_ee_points and ee_point; please choose only one."
+
+    assert (
+        args.random_ee_points is None
+        or isinstance(args.random_ee_points, (list, tuple))
+        and len(args.random_ee_points) > 0
+    ), "random_ee_points must be a non-empty list or tuple"
+
+    # Validate weighted sampling config
+    if args.random_ee_probs is not None:
+        assert (
+            args.random_ee_points is not None
+        ), "--random-ee-probs requires --random-ee-points"
+        assert len(args.random_ee_probs) == len(
+            args.random_ee_points
+        ), "--random-ee-probs must have same length as --random-ee-points"
+        assert all(
+            p >= 0 for p in args.random_ee_probs
+        ), "--random-ee-probs must be non-negative"
 
     if args.tokenize_prompt:
         assert (
@@ -1969,6 +2100,38 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+
+    parser.add_argument(
+        "--ee-point",
+        type=int,
+        default=None,
+        help="Early Exit for Ruyi Models, see also https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi",
+    )
+    parser.add_argument(
+        "--random-ee-points",
+        type=int,
+        nargs="+",
+        default=None,
+        help="List of random early-exit points, e.g. --random-ee-points 3 7 11 15",
+    )
+    parser.add_argument(
+        "--random-ee-probs",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Sampling probabilities for --random-ee-points (same length, will be normalized implicitly). "
+            "Example: --random-ee-points 3 7 11 --random-ee-probs 0.7 0.2 0.1"
+        ),
+    )
+    parser.add_argument(
+        "--random-ee-sequential",
+        action="store_true",
+        help=(
+            "Assign ee_point sequentially (ascending by ee_point) according to --random-ee-points/--random-ee-probs proportions, "
+            "instead of sampling randomly per request."
+        ),
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")

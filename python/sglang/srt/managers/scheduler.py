@@ -26,7 +26,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -350,6 +350,22 @@ class Scheduler(
             nccl_port=port_args.nccl_port,
         )
 
+        if isinstance(self.tp_worker, TpModelWorkerClient):
+            is_ee_model = self.tp_worker.worker.model_config.is_ee_model
+        else:
+            is_ee_model = self.tp_worker.model_config.is_ee_model
+        disable_cuda_graph = self.server_args.disable_cuda_graph
+        enable_ee_bucket = self.server_args.enable_ee_bucket
+        if is_ee_model and not disable_cuda_graph and not enable_ee_bucket:
+            raise ValueError(
+                "Early‑exit models must set `enable_ee_bucket=True` when using CUDA Graph."
+            )
+
+        if not is_ee_model and enable_ee_bucket:
+            raise ValueError(
+                "`enable_ee_bucket` can only be enabled for early‑exit (EE) models."
+            )
+
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -419,6 +435,24 @@ class Scheduler(
 
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
+
+        self.enable_ee_bucket = server_args.enable_ee_bucket
+        if self.enable_ee_bucket:
+            from collections import defaultdict, deque
+
+            self.waiting_buckets: Dict[int, Deque[Req]] = defaultdict(deque)
+            self.cur_bucket_id: Optional[int] = None
+
+            if self.pp_size > 1:
+                self.running_buckets: List[Dict[int, ScheduleBatch]] = [
+                    defaultdict(lambda: ScheduleBatch(reqs=[], batch_is_full=False))
+                    for _ in range(self.pp_size)
+                ]
+            else:
+                self.running_buckets: Dict[int, ScheduleBatch] = defaultdict(
+                    lambda: ScheduleBatch(reqs=[], batch_is_full=False)
+                )
+                self.running_bucket_id: Optional[int] = None
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -876,7 +910,8 @@ class Scheduler(
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
-                mbs[mb_id] = self.get_next_batch_to_run()
+
+                mbs[mb_id] = self.get_next_batch_to_run(mb_id=mb_id)
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch = mbs[mb_id]
@@ -1129,6 +1164,13 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if recv_req.ee_point is not None:
+                req.ee_point = recv_req.ee_point
+                if req.ee_point == -1:
+                    req.ee_point = self.model_config.early_exit_points[-1]
+                if req.ee_point not in self.model_config.early_exit_points:
+                    req.ee_point = self.model_config.default_early_exit_point
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
@@ -1154,6 +1196,13 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            if recv_req.ee_point is not None:
+                req.ee_point = recv_req.ee_point
+                if req.ee_point == -1:
+                    req.ee_point = self.model_config.early_exit_points[-1]
+                if req.ee_point not in self.model_config.early_exit_points:
+                    req.ee_point = self.model_config.default_early_exit_point
+
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
@@ -1264,7 +1313,17 @@ class Scheduler(
                     self.tree_cache.prefetch_from_storage(
                         req.rid, req.last_host_node, new_input_tokens, last_hash
                     )
-            self.waiting_queue.append(req)
+
+            if self.model_config.is_ee_model:
+                ee_point = req.ee_point
+                if ee_point is None:
+                    ee_point = self.model_config.default_early_exit_point
+                if self.enable_ee_bucket:
+                    self.waiting_buckets[ee_point].append(req)
+                else:
+                    self.waiting_queue.append(req)
+            else:
+                self.waiting_queue.append(req)
 
     def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1275,7 +1334,14 @@ class Scheduler(
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
-            self.waiting_queue.extend(reqs)
+            if self.enable_ee_bucket:
+                for r in reqs:
+                    ee_point = r.ee_point
+                    if ee_point is None:
+                        ee_point = self.model_config.default_early_exit_point
+                    self.waiting_buckets[ee_point].append(r)
+            else:
+                self.waiting_queue.extend(reqs)
 
     def handle_embedding_request(
         self,
@@ -1598,7 +1664,9 @@ class Scheduler(
             swa_evictable_size,
         )
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+    def get_next_batch_to_run(
+        self, mb_id: Optional[int] = None
+    ) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1622,13 +1690,29 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch
-            if not self.last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+            if self.enable_ee_bucket:
+                if not self.last_batch.is_empty():
+                    ee_point = self.last_batch.ee_point
+                    if self.pp_size > 1 and mb_id is not None:
+                        if self.running_buckets[mb_id][ee_point].is_empty():
+                            self.running_buckets[mb_id][ee_point] = self.last_batch
+                        else:
+                            self.running_buckets[mb_id][ee_point].merge_batch(
+                                self.last_batch
+                            )
+                    else:
+                        if self.running_buckets[ee_point].is_empty():
+                            self.running_buckets[ee_point] = self.last_batch
+                        else:
+                            self.running_buckets[ee_point].merge_batch(self.last_batch)
+            else:
+                # Merge the new batch into the running batch
+                if not self.last_batch.is_empty():
+                    if self.running_batch.is_empty():
+                        self.running_batch = self.last_batch
+                    else:
+                        # Merge running_batch with prefill batch
+                        self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
 
@@ -1645,11 +1729,36 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode
-            if not self.running_batch.is_empty():
-                self.running_batch = self.update_running_batch(self.running_batch)
+            if self.enable_ee_bucket:
+                bucket_hit = False
+                while not bucket_hit:
+                    bucket_hit = True
+                    if self.pp_size > 1 and mb_id is not None:
+                        bucket_id = self._pick_running_bucket(mb_id)
+                    else:
+                        bucket_id = self._pick_running_bucket()
+                    if bucket_id is not None:
+                        if self.pp_size > 1 and mb_id is not None:
+                            self.running_batch = self.running_buckets[mb_id][bucket_id]
+                        else:
+                            self.running_batch = self.running_buckets[bucket_id]
+                    if not self.running_batch.is_empty():
+                        self.running_batch = self.update_running_batch(
+                            self.running_batch
+                        )
+                        if self.running_batch.is_empty():
+                            bucket_hit = False
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
-                ret = None
+                if not self.running_batch.is_empty():
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    ret = (
+                        self.running_batch
+                        if not self.running_batch.is_empty()
+                        else None
+                    )
+                else:
+                    ret = None
 
         # Handle DP attention
         if need_dp_attn_preparation:
@@ -1667,6 +1776,13 @@ class Scheduler(
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
+
+        if self.enable_ee_bucket and len(self.waiting_queue) == 0:
+            bucket_id = self._pick_next_bucket()
+            if bucket_id is None:
+                return None
+            self.cur_bucket_id = bucket_id
+            self.waiting_queue = self.waiting_buckets[bucket_id]
 
         # Handle the cases where prefill is not allowed
         if (
@@ -1761,9 +1877,16 @@ class Scheduler(
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        if self.enable_ee_bucket:
+            # Filter once (O(n)) and mutate in-place to preserve alias to bucket deque
+            can_run_ids = {id(x) for x in can_run_list}
+            keep = [x for x in self.waiting_queue if id(x) not in can_run_ids]
+            self.waiting_queue.clear()
+            self.waiting_queue.extend(keep)
+        else:
+            self.waiting_queue = [
+                x for x in self.waiting_queue if x not in set(can_run_list)
+            ]
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -1788,6 +1911,21 @@ class Scheduler(
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
+
+        if self.model_config.is_ee_model:
+            ee_point = None
+            if not self.enable_ee_bucket:
+                ee_point = self.model_config.default_early_exit_point
+            else:
+                ee_point = self.cur_bucket_id
+            new_batch.ee_point = ee_point
+
+        if self.enable_ee_bucket:
+            if not self.waiting_queue and self.cur_bucket_id is not None:
+                del self.waiting_buckets[self.cur_bucket_id]
+                self.waiting_queue = []
+                self.cur_bucket_id = None
+
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -2856,6 +2994,29 @@ class Scheduler(
             if events:
                 batch = KVEventBatch(ts=time.time(), events=events)
                 self.kv_event_publisher.publish(batch)
+
+    def _pick_next_bucket(self):
+        if not self.waiting_buckets:
+            return None
+        return max(
+            self.waiting_buckets,
+            key=lambda b: len(self.waiting_buckets[b]),
+            default=None,
+        )
+
+    def _pick_running_bucket(self, mb_id: Optional[int] = None):
+        if mb_id is None:
+            return max(
+                self.running_buckets,
+                key=lambda b: self.running_buckets[b].batch_size(),
+                default=None,
+            )
+        else:
+            return max(
+                self.running_buckets[mb_id],
+                key=lambda b: self.running_buckets[mb_id][b].batch_size(),
+                default=None,
+            )
 
 
 def is_health_check_generate_req(recv_req):

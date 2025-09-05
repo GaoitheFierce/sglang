@@ -157,10 +157,16 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None:
-            if gpu_mem > 90 * 1024:  # H200, H20
-                capture_bs += list(range(160, 257, 8))
-            if gpu_mem > 160 * 1000:  # B200, MI300
-                capture_bs += list(range(256, 513, 16))
+            if model_runner.model_config.is_ee_model:
+                if gpu_mem > 1.5 * 90 * 1024:  # H200, H20
+                    capture_bs += list(range(160, 257, 8))
+                if gpu_mem > 1.5 * 160 * 1000:  # B200, MI300
+                    capture_bs += list(range(256, 513, 16))
+            else:
+                if gpu_mem > 90 * 1024:  # H200, H20
+                    capture_bs += list(range(160, 257, 8))
+                if gpu_mem > 160 * 1000:  # B200, MI300
+                    capture_bs += list(range(256, 513, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -349,11 +355,22 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        is_bs_supported = (
-            cuda_graph_bs in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+        ee_point = forward_batch.ee_point
+        if self.model_runner.model_config.is_ee_model:
+            if ee_point is None:
+                ee_point = self.model_runner.model_config.default_early_exit_point
+            is_bs_supported = (
+                (ee_point, cuda_graph_bs) in self.graphs
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+                and (ee_point, self.max_bs) in self.graphs
+            )
+        else:
+            is_bs_supported = (
+                cuda_graph_bs in self.graphs
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+            )
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -407,38 +424,79 @@ class CudaGraphRunner:
                     self.model_runner.gpu_id,
                     empty_cache=False,
                 )
-                # Reverse the order to enable better memory sharing across cuda graphs.
-                capture_range = (
-                    tqdm.tqdm(list(reversed(self.capture_bs)))
-                    if get_tensor_model_parallel_rank() == 0
-                    else reversed(self.capture_bs)
-                )
-                for i, bs in enumerate(capture_range):
-                    if get_tensor_model_parallel_rank() == 0:
-                        avail_mem = get_available_gpu_memory(
-                            self.model_runner.device,
-                            self.model_runner.gpu_id,
-                            empty_cache=False,
-                        )
-                        capture_range.set_description(
-                            f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
-                        )
 
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward)
-                        self.graphs[bs] = graph
-                        self.output_buffers[bs] = output_buffers
+                model_config = self.model_runner.model_config
+                if model_config.is_ee_model:
+                    assert (
+                        model_config.early_exit_points[-1]
+                        == model_config.num_hidden_layers - 1
+                    )
+                    for ee_point in model_config.early_exit_points:
+                        # Reverse the order to enable better memory sharing across cuda graphs.
+                        capture_range = (
+                            tqdm.tqdm(list(reversed(self.capture_bs)))
+                            if get_tensor_model_parallel_rank() == 0
+                            else reversed(self.capture_bs)
+                        )
+                        for i, bs in enumerate(capture_range):
+                            if get_tensor_model_parallel_rank() == 0:
+                                avail_mem = get_available_gpu_memory(
+                                    self.model_runner.device,
+                                    self.model_runner.gpu_id,
+                                    empty_cache=False,
+                                )
+                                capture_range.set_description(
+                                    f"Compiling EE layer {ee_point}; capturing batch size {bs} (available memory: {avail_mem:.2f} GB)"
+                                )
 
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
+                            with patch_model(
+                                self.model_runner.model,
+                                bs in self.compile_bs,
+                                num_tokens=bs * self.num_tokens_per_bs,
+                                tp_group=self.model_runner.tp_group,
+                            ) as forward:
+                                (
+                                    graph,
+                                    output_buffers,
+                                ) = self.capture_one_batch_size(bs, forward, ee_point)
+                                self.graphs[(ee_point, bs)] = graph
+                                self.output_buffers[(ee_point, bs)] = output_buffers
+
+                            # Save gemlite cache after each capture
+                            save_gemlite_cache()
+                else:
+                    # Reverse the order to enable better memory sharing across cuda graphs.
+                    capture_range = (
+                        tqdm.tqdm(list(reversed(self.capture_bs)))
+                        if get_tensor_model_parallel_rank() == 0
+                        else reversed(self.capture_bs)
+                    )
+                    for i, bs in enumerate(capture_range):
+                        if get_tensor_model_parallel_rank() == 0:
+                            avail_mem = get_available_gpu_memory(
+                                self.model_runner.device,
+                                self.model_runner.gpu_id,
+                                empty_cache=False,
+                            )
+                            capture_range.set_description(
+                                f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                            )
+
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(bs, forward)
+                            self.graphs[bs] = graph
+                            self.output_buffers[bs] = output_buffers
+
+                        # Save gemlite cache after each capture
+                        save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
             log_message = (
@@ -453,7 +511,7 @@ class CudaGraphRunner:
             )
             logger.info(log_message)
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable, ee_point: int = None):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -540,6 +598,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_paths=lora_paths,
+            ee_point=ee_point,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -555,6 +614,7 @@ class CudaGraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            ee_point=ee_point,
         )
 
         # Run and capture
@@ -692,6 +752,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
+            ee_point=forward_batch.ee_point,
         )
 
         # Store fields
@@ -705,6 +766,12 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if self.model_runner.model_config.is_ee_model:
+            ee_point = forward_batch.ee_point
+            if ee_point is None:
+                ee_point = self.model_runner.model_config.default_early_exit_point
+                forward_batch.ee_point = ee_point
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -713,9 +780,13 @@ class CudaGraphRunner:
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self.graphs[self.bs].replay()
+        if self.model_runner.model_config.is_ee_model:
+            self.graphs[(ee_point, self.bs)].replay()
+            output = self.output_buffers[(ee_point, self.bs)]
+        else:
+            self.graphs[self.bs].replay()
+            output = self.output_buffers[self.bs]
 
-        output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],

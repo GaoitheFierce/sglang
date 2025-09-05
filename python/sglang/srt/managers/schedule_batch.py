@@ -611,6 +611,10 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
+        # Early Exit Point for Ruyi Models
+        # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+        self.ee_point = None
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -886,6 +890,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = 0
+
+    # Early Exit Point for Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point = None
 
     @classmethod
     def init_new(
@@ -1753,6 +1761,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            ee_point=self.ee_point,
         )
 
     def copy(self):
@@ -1895,6 +1904,10 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # Early Exitfor Ruyi Models
+    # https://github.com/TeleAI-AI-Flow/AI-Flow-Ruyi
+    ee_point: int = None
 
 
 @triton.jit
